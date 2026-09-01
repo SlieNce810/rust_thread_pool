@@ -1,12 +1,11 @@
-use std::{sync::Arc, thread::{self, JoinHandle}};
+use std::{sync::{Arc, Condvar}, thread::{self, JoinHandle}};
 
-
-
+use crate::{job, pool::Shared};
 /// 一个 worker = 一个 OS 线程 + 它的 join 句柄
 /// handle 套在 Opting 是因为 JoinHandle::join 按值消费 self，
 /// 而 worker 纯在 Vec 里，不 take 出来就拿不走
 pub struct Worker {
-    handle: Option<JoinHandle<()>>,
+    pub(crate) handle: Option<JoinHandle<()>>,
 }
 
 impl Worker {
@@ -32,6 +31,22 @@ fn run(shared: Arc<Shared>) {
         //   3. 醒了发现「已关闭 且 队列空」→ return
         //   4. 否则 pop_front 一个任务
         //   5. 先出锁，再跑任务 —— 拿着锁跑任务会把所有提交方堵死
-        unimplemented!()
+
+        let job = {
+            // 1. 抢 shared.inner 的锁
+            let mut inner = shared.inner.lock().unwrap(); 
+            // 2. 没任务 且 没关闭 → 睡（shared.wake.wait，记得放 while 里）
+            while inner.jobs.is_empty() && !inner.is_shutdown {  
+                inner = shared.wake.wait(inner).unwrap();
+            }
+
+            // 3. 醒了发现「已关闭 且 队列空」→ return
+            if inner.is_shutdown && inner.jobs.is_empty() {
+                return;
+            };
+            // 4. 否则 pop_front 一个任务
+            inner.jobs.pop_front().unwrap()
+        };
+        job();
     }
 }

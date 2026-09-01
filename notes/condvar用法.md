@@ -1,9 +1,3 @@
-你贴出的这段文字，正是 Rust 标准库中 **`std::sync::Condvar`**（条件变量）的官方文档精髓。结合你上一轮定义的 `Shared` 结构体（包含 `Condvar` 和 `Mutex`），这段话其实是在揭示 **Condvar 正确使用的两大铁律**。
-
-如果只看文字不理解底层机制，写出来的代码极容易出 Bug。我来帮你逐句拆解，并解释为什么 Rust 要这么设计：
-
----
-
 ### 1. 关于“必须在 Mutex 内验证谓词（Predicate）”
 
 > “The predicate is always verified inside of the mutex before determining that a thread must block.”

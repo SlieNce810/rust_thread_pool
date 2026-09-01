@@ -1,5 +1,9 @@
-//! 阶段 0 验收：任务真的跑了 / Drop 不丢任务 / 多线程提交不炸。
-use thread_pool::ThreadPool;
+use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+
+/// 阶段 0 验收：任务真的跑了 / Drop 不丢任务 / 多线程提交不炸。
+use crate::ThreadPool;
 
 #[test]
 fn submitted_jos_actually_run() {

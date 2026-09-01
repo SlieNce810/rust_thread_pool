@@ -1,10 +1,8 @@
-
-
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::job::Job;
-use crate::worker::Worker;
+use crate::worker::{self, Worker};
 
 /// 所有 worker 和所有提交方共享的那一坨状态。
 /// 字段用 pub(crate) 而不是私有：worker.rs 是兄弟模块，私有字段它看不见。
@@ -47,18 +45,18 @@ impl ThreadPool {
     /// 也不管「关闭后还提交」的情况（三态关闭是阶段 5 的事）。
     pub fn submit<F>(&self, job: F)
     where 
-        F:FnOnce() + Send() + 'static,
-    {
+        F: FnOnce() + Send + 'static,
         {
-            let mut inner = self.shared.inner.lock().unwrap();
-            inner.jobs.push_back(Box::new(job));
+            {
+                let mut inner = self.shared.inner.lock().unwrap();
+                inner.jobs.push_back(Box::new(job));
+            }
+            // TODO(你・留白 B)：唤醒 worker。
+            // 选 notify_one 还是 notify_all？说清楚你选它的理由。
+            self.shared.wake.notify_one();
         }
-    }    
-
-    // TODO(你・留白 B)：唤醒 worker。
-    // 选 notify_one 还是 notify_all？说清楚你选它的理由。
-    unimplemented!()
 }
+
 
 impl Drop for ThreadPool {
     /// 排空语义：把队列里剩下的任务全跑完，worker 才退出。
@@ -69,6 +67,16 @@ impl Drop for ThreadPool {
         // 两个坑先想清楚：
         //   - 置标志必须持锁，否则和 worker 的「检查标志 + 入睡」错开，就是经典丢唤醒
         //   - 只 notify_one 的话，剩下那几个 worker 会永远睡下去，join 直接卡死
-        unimplemented!()
+        {
+            let mut inner = self.shared.inner.lock().unwrap();
+            inner.is_shutdown = true;
+        }
+        self.shared.wake.notify_all();
+
+        for worker in &mut self.workers {
+            if let Some(handle) = worker.handle.take() {
+                handle.join().unwrap();
+            }
+        }
     }
 }
