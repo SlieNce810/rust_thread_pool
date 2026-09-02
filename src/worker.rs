@@ -6,7 +6,7 @@ use crate::pool::Shared;
 /// handle 套在 Opting 是因为 JoinHandle::join 按值消费 self，
 /// 而 worker 纯在 Vec 里，不 take 出来就拿不走
 pub struct Worker {
-    pub(crate) handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl Worker {
@@ -16,6 +16,8 @@ impl Worker {
     }
 
     pub fn join(mut self) {
+        // 故意吞掉 Err：worker 带着 panic 结束是预期内的（catch_unwind 兜不住时），
+        // 不是线程池自身的 bug，不该把错误往上抛
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }

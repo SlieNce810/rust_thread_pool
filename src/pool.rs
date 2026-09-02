@@ -80,10 +80,8 @@ impl Drop for ThreadPool {
         }
         self.shared.wake.notify_all();
 
-        for worker in &mut self.workers {
-            if let Some(handle) = worker.handle.take() {
-                handle.join().unwrap();
-            }
+        for worker in self.workers.drain(..) {
+            worker.join();
         }
     }
 }
