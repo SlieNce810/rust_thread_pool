@@ -1,14 +1,16 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::job::Job;
-use crate::worker::{self, Worker};
+use crate::worker::Worker;
 
 /// 所有 worker 和所有提交方共享的那一坨状态。
 /// 字段用 pub(crate) 而不是私有：worker.rs 是兄弟模块，私有字段它看不见。
 pub(crate) struct Shared {
     pub(crate) wake: Condvar,
     pub(crate) inner: Mutex<Inner>,
+    pub(crate) panic_conut: AtomicUsize,
 }
 
 pub(crate) struct Inner {
@@ -32,6 +34,7 @@ impl ThreadPool {
                 jobs: VecDeque::new(), 
                 is_shutdown: false,
             }),
+            panic_conut: AtomicUsize::new(0),
         });
 
         let workers = (0..thread_count)
@@ -55,6 +58,10 @@ impl ThreadPool {
             // 选 notify_one 还是 notify_all？说清楚你选它的理由。
             self.shared.wake.notify_one();
         }
+
+    pub fn panic_conut(&self) -> usize {
+        self.shared.panic_conut.load(Ordering::Relaxed)
+    }
 }
 
 

@@ -2,6 +2,7 @@ use std::sync::{mpsc, Arc};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
+
 /// 阶段 0 验收：任务真的跑了 / Drop 不丢任务 / 多线程提交不炸。
 use crate::ThreadPool;
 
@@ -69,4 +70,21 @@ fn many_threads_submit_at_once() {
     drop(pool); // 8 个发送线程的克隆已随线程结束释放，这里才真正触发 Drop
 
     assert_eq!(counter.load(Ordering::SeqCst), 800);
+}
+
+#[test]
+fn panic_does_not_kill_worker() {
+    let pool = ThreadPool::new(4);
+    let conut = Arc::new(AtomicUsize::new(0));
+
+    for i in 0..20 {
+        let count = Arc::clone(&conut);
+
+        pool.submit(move || {
+            if i % 5 == 0 {
+                panic!("boom");
+            }
+            count.fetch_add(1, Ordering::Relaxed);
+        });
+    }
 }

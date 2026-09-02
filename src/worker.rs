@@ -1,6 +1,7 @@
-use std::{sync::{Arc, Condvar}, thread::{self, JoinHandle}};
+use std::{panic::AssertUnwindSafe, sync::{atomic::Ordering, Arc}, thread::{self, JoinHandle}};
+use std::panic::catch_unwind;
 
-use crate::{job, pool::Shared};
+use crate::pool::Shared;
 /// 一个 worker = 一个 OS 线程 + 它的 join 句柄
 /// handle 套在 Opting 是因为 JoinHandle::join 按值消费 self，
 /// 而 worker 纯在 Vec 里，不 take 出来就拿不走
@@ -47,6 +48,13 @@ fn run(shared: Arc<Shared>) {
             // 4. 否则 pop_front 一个任务
             inner.jobs.pop_front().unwrap()
         };
-        job();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            job();
+        }));
+
+        if result.is_err() {
+            shared.panic_conut.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
