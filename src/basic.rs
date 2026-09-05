@@ -4,7 +4,7 @@ use std::thread;
 
 
 /// 阶段 0 验收：任务真的跑了 / Drop 不丢任务 / 多线程提交不炸。
-use crate::ThreadPool;
+use crate::{RecvError, ThreadPool};
 
 #[test]
 fn submitted_jos_actually_run() {
@@ -87,4 +87,18 @@ fn panic_does_not_kill_worker() {
             count.fetch_add(1, Ordering::Relaxed);
         });
     }
+}
+
+#[test]
+fn submit_returns_value() {
+    let pool = ThreadPool::new(4);
+    let handle = pool.submit(|| 21 * 2);
+    assert_eq!(handle.wait(), Ok(42));
+}
+
+#[test]
+fn panic_task_returns_error() {
+    let pool = ThreadPool::new(4);
+    let handle = pool.submit(|| panic!("boom!"));
+    assert_eq!(handle.wait(), Err(RecvError));
 }

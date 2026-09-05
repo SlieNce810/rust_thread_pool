@@ -19,7 +19,9 @@ impl Worker {
         // 故意吞掉 Err：worker 带着 panic 结束是预期内的（catch_unwind 兜不住时），
         // 不是线程池自身的 bug，不该把错误往上抛
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            if handle.join().is_err() {
+                eprintln!("warning: worker thread pancked unexpectedly");
+            }
         }
     }
 }
@@ -56,7 +58,7 @@ fn run(shared: Arc<Shared>) {
         }));
 
         if result.is_err() {
-            shared.panic_conut.fetch_add(1, Ordering::Relaxed);
+            shared.panic_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

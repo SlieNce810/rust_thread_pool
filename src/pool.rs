@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::job::Job;
+use crate::oneshot::{self, RecvError, channel};
 use crate::worker::Worker;
 
 /// 所有 worker 和所有提交方共享的那一坨状态。
@@ -10,7 +11,7 @@ use crate::worker::Worker;
 pub(crate) struct Shared {
     pub(crate) wake: Condvar,
     pub(crate) inner: Mutex<Inner>,
-    pub(crate) panic_conut: AtomicUsize,
+    pub(crate) panic_count: AtomicUsize,
 }
 
 pub(crate) struct Inner {
@@ -21,6 +22,10 @@ pub(crate) struct Inner {
 pub struct ThreadPool {
     workers: Vec<Worker>,
     shared: Arc<Shared>,
+}
+
+pub struct TaskHandle<T> {
+    rx: oneshot::Receiver<T>,
 }
 
 impl ThreadPool {
@@ -34,7 +39,7 @@ impl ThreadPool {
                 jobs: VecDeque::new(), 
                 is_shutdown: false,
             }),
-            panic_conut: AtomicUsize::new(0),
+            panic_count: AtomicUsize::new(0),
         });
 
         let workers = (0..thread_count)
@@ -44,23 +49,52 @@ impl ThreadPool {
         ThreadPool { workers, shared }
     }
 
-    /// 提交任务。阶段 0 不返回结果（oneshot 是阶段 2 的事），
-    /// 也不管「关闭后还提交」的情况（三态关闭是阶段 5 的事）。
-    pub fn submit<F>(&self, job: F)
-    where 
-        F: FnOnce() + Send + 'static,
-        {
-            {
-                let mut inner = self.shared.inner.lock().unwrap();
-                inner.jobs.push_back(Box::new(job));
-            }
-            // TODO(你・留白 B)：唤醒 worker。
-            // 选 notify_one 还是 notify_all？说清楚你选它的理由。
-            self.shared.wake.notify_one();
-        }
+    /// 提交任务，并返回一个 TaskHandle<T>。
+    /// 任务在线程池中执行，结果通过 oneshot 返回。
+    /// job: F
+    /// │
+    /// │ F: FnOnce() -> T
+    /// ▼
+    ///let out = job()
+    /// │
+    /// │ 得到 T
+    /// ▼
+    ///tx.send(out)
+    /// │
+    /// │ T 被送进 oneshot
+    /// ▼
+    ///wrapped 返回 ()
+    /// │
+    /// ▼
+    ///Box<dyn FnOnce() + Send>
+    /// │
+    /// ▼
+    ///线程池 Job 队列
+    pub fn submit<F, T>(&self, job: F) -> TaskHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = channel();
 
-    pub fn panic_conut(&self) -> usize {
-        self.shared.panic_conut.load(Ordering::Relaxed)
+        let wrapped = move || {
+            let out = job();
+            tx.send(out);
+        };
+
+        {
+            let mut inner = self.shared.inner.lock().unwrap();
+            if inner.is_shutdown {
+                panic!("cannot submit to a shutdown thread pool")
+            }
+            inner.jobs.push_back(Box::new(wrapped));
+        }
+        self.shared.wake.notify_one();
+        TaskHandle { rx }
+    }
+
+    pub fn panic_count(&self) -> usize {
+        self.shared.panic_count.load(Ordering::Relaxed)
     }
 }
 
@@ -69,11 +103,6 @@ impl Drop for ThreadPool {
     /// 排空语义：把队列里剩下的任务全跑完，worker 才退出。
     /// 不是「丢掉剩下的任务」。
     fn drop(&mut self) {
-        // TODO(你・留白 C)：置 is_shutdown → 唤醒 worker → join 等它们排空退出
-        //
-        // 两个坑先想清楚：
-        //   - 置标志必须持锁，否则和 worker 的「检查标志 + 入睡」错开，就是经典丢唤醒
-        //   - 只 notify_one 的话，剩下那几个 worker 会永远睡下去，join 直接卡死
         {
             let mut inner = self.shared.inner.lock().unwrap();
             inner.is_shutdown = true;
@@ -83,5 +112,11 @@ impl Drop for ThreadPool {
         for worker in self.workers.drain(..) {
             worker.join();
         }
+    }
+}
+
+impl<T> TaskHandle<T> {
+    pub fn wait(self) -> Result<T, RecvError> {
+        self.rx.recv()
     }
 }
