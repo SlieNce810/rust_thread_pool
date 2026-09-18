@@ -1,4 +1,5 @@
 mod job;
+mod deque;
 mod pool;
 mod worker;
 mod oneshot;
