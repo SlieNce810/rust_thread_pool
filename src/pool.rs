@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::deque::Deque;
-use crate::job::Job;
+use crate::job::{self, Job};
 use crate::oneshot::{self, RecvError, channel};
 use crate::worker::{with_worker_ctx, Worker};
 
@@ -77,26 +77,35 @@ impl ThreadPool {
         // 两条路最终都把 Box::new(wrapped) 送进某个队列；尾巴 TaskHandle { rx } 共用。
         with_worker_ctx(|ctx| match ctx {
             None => {
-                // 外部线程 → 全局队列。
-                todo!(
-                    "H0-外部（老路径照搬）：
-                     锁 inner；is_shutdown 就 panic!（老语义）；
-                     jobs.push_back(Box::new(wrapped))；放锁；wake.notify_one()。"
-                )
+                let mut inner = self.shared.inner.lock().unwrap();
+                if inner.is_shutdown {
+                    panic!("cannot submit to a shutdown thread pool");
+                }
+                inner.jobs.push_back(Box::new(wrapped));
+                drop(inner);
+                self.shared.wake.notify_one();
             }
             Some(ctx) => {
                 // worker 线程 → 快路径。
-                todo!(
-                    "H0-快：ctx.shared.deques[ctx.index].push(Box::new(wrapped))
-                     ——无锁、不碰全局队列、不检查 is_shutdown。落键盘前想清楚三件事：
-                     ① 为什么敢不查 shutdown？提示在 worker 的退出条件里：
-                        「shutdown && 全局空 && 自己 deque 空」——worker 睡前会把自己 deque 排空，
-                        所以从它身上 submit 的任务永远不会被丢，Drop 的排空语义不破。
-                     ② 要不要 notify？睡着的同伴偷得到你的 deque，但本阶段可以先不 notify：
-                        等结果的父任务靠 H4 帮助循环自己消化自己的货。
-                        （定向唤醒是阶段 4 的活。）把这个取舍写成注释留在这。
-                     ③ push 满了（1024）：Err(job) 退回全局队列老路径，兜底不丢任务。"
-                )
+                // todo!(
+                //     "H0-快：ctx.shared.deques[ctx.index].push(Box::new(wrapped))
+                //      ——无锁、不碰全局队列、不检查 is_shutdown。落键盘前想清楚三件事：
+                //      ① 为什么敢不查 shutdown？提示在 worker 的退出条件里：
+                //         「shutdown && 全局空 && 自己 deque 空」——worker 睡前会把自己 deque 排空，
+                //         所以从它身上 submit 的任务永远不会被丢，Drop 的排空语义不破。
+                //      ② 要不要 notify？睡着的同伴偷得到你的 deque，但本阶段可以先不 notify：
+                //         等结果的父任务靠 H4 帮助循环自己消化自己的货。
+                //         （定向唤醒是阶段 4 的活。）把这个取舍写成注释留在这。
+                //      ③ push 满了（1024）：Err(job) 退回全局队列老路径，兜底不丢任务。"
+                // )
+                //ctx.index 是本线程的编号，所以你 push 的是「自己的」deque。
+                let job: Job = Box::new(wrapped);
+                if let Err(job) = ctx.shared.deques[ctx.index].push(job) {
+                    let mut inner = self.shared.inner.lock().unwrap();
+                    inner.jobs.push_back(job);
+                    drop(inner);
+                    self.shared.wake.notify_one();
+                }
             }
         });
 
