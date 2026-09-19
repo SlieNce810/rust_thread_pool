@@ -9,3 +9,5 @@ pub use oneshot::RecvError;
 
 #[cfg(test)]
 mod basic;
+#[cfg(test)]
+mod stealing;

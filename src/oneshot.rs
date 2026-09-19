@@ -91,4 +91,21 @@ impl<T> Receiver<T> {
             Slot::Empty => unreachable!(),
         }
     }
+
+    /// 非阻塞看一眼：Some(Ok(v))＝值到了；Some(Err)＝发送端死了；None＝还没结论。
+    /// wait() 的帮助循环（阶段 3 的 H4）靠它轮询——所以 Empty 必须原样放回去：
+    /// 看一眼 ≠ 消费，消费权（Filled → Closed 那一步）留给真正拿到值的那次调用。
+    pub(crate) fn try_recv(&self) -> Option<Result<T, RecvError>> {
+        let Inner { slot, wake: _ } = &*self.inner;
+        let mut guard = slot.lock().unwrap();
+
+        if matches!(*guard, Slot::Empty) {
+            return None; // 没结论，槽保持 Empty
+        }
+        match std::mem::replace(&mut *guard, Slot::Closed) {
+            Slot::Filled(v) => Some(Ok(v)),
+            Slot::Closed => Some(Err(RecvError)),
+            Slot::Empty => unreachable!(),
+        }
+    }
 }

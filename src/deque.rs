@@ -6,11 +6,10 @@
 //! 三个角色（A10 的三词模型，写代码时对着看）：
 //!   bottom → publication  管有没有货（owner 独写，thief 只读）
 //!   top    → arbitration  管货归谁（所有 thief + owner 抢最后一件时都写）
-//!   slot   → payload      真正的货（plain 读写，安全性由协议保证，见 Q4c）
+//!   slot   → payload      只存堆上那件货的地址（真正的货在堆对象里，见 Q4c）
 
-use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
-use std::sync::atomic::{fence, AtomicIsize, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicIsize, AtomicPtr, Ordering, fence};
 
 const DEFAULT_CAPACITY: usize = 1024;
 
@@ -25,14 +24,14 @@ pub(crate) struct Deque<T> {
 struct Buffer<T> {
     capacity: usize,
     mask: usize,
-    slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
+    slots: Box<[AtomicPtr<T>]>,
 }
 
 // 槽的跨线程读写只发生在协议授权的独占窗口里：
 //   写 —— 这个下标还没发布（push：bottom 尚未越过它），或已赢得唯一消费权；
 //   读 —— 一定先 CAS 赢得了该逻辑下标的唯一消费权（Q3d）。
 // 交接全部经过 bottom/top 的原子协议，所以只要 T: Send，Sync 就成立。
-// 注意：是协议+序+CAS 在担保安全（Q4c），UnsafeCell 本身什么都不担保。
+// 注意：是协议+序+CAS 在担保安全（Q4c），AtomicPtr 本身什么都不担保。
 unsafe impl<T: Send> Sync for Buffer<T> {}
 
 // 同理：跨线程的数据交接（slot 里的 T）只经协议授权的窗口；
@@ -42,13 +41,13 @@ unsafe impl<T: Send> Sync for Deque<T> {}
 
 impl<T> Buffer<T> {
     fn new(capacity: usize) -> Self {
-        let slots: Vec<UnsafeCell<MaybeUninit<T>>> = (0..capacity)
-            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+        let slots = (0..capacity)
+            .map(|_| AtomicPtr::new(ptr::null_mut()))
             .collect();
         Self {
             capacity,
             mask: capacity - 1,
-            slots: slots.into_boxed_slice(),
+            slots,
         }
     }
 
@@ -62,16 +61,17 @@ impl<T> Buffer<T> {
     /// # Safety（调用方的两条义务，都出自问答录）
     /// Q3a —— 该下标还没发布给 thief（bottom 尚未越过它）；或
     /// Q3d —— 该下标的唯一消费权已归我。
-    unsafe fn write(&self, i: isize, value: T) {
-        unsafe { (*self.slots[self.index(i)].get()).write(value); }
+    fn write(&self, i: isize, value: T) {
+        let ptr = Box::into_raw(Box::new(value));
+        self.slots[self.index(i)]
+            .store(ptr, Ordering::Relaxed);
     }
 
-    /// 读槽并拿走 T。
-    /// # Safety
-    /// 必须先 CAS 赢得该逻辑下标的唯一消费权（Q3d），
-    /// 且该下标已被发布（Q3a）——否则会读到半初始化的货，或同一件货被读两次。
-    unsafe fn read(&self, i: isize) -> T {
-        unsafe { (*self.slots[self.index(i)].get()).assume_init_read() }
+    /// 只把槽里的地址值抄一份出来，不涉及所有权。
+    /// 取货的人先赢得该下标的唯一消费权，再决定要不要 Box::from_raw 接管它。
+    fn load_ptr(&self, i: isize) -> *mut T {
+        self.slots[self.index(i)]
+            .load(Ordering::Relaxed)
     }
 }
 
@@ -94,72 +94,142 @@ impl<T> Deque<T> {
 
     /// owner 入队（LIFO 端）。满则原样退回，不丢数据。
     pub(crate) fn push(&self, value: T) -> Result<(), T> {
-        let b = self.bottom.load(Ordering::Relaxed); // 读自己的私账：没人和我抢写，读哪个序都行
-        let t = self.top.load(Ordering::Acquire); // 公账只为算余量；top 只前进，读旧了只会更保守
+        let b = self.bottom.load(Ordering::Relaxed);
+        let t = self.top.load(Ordering::Acquire);
+
         if b.wrapping_sub(t) >= self.buffer.capacity as isize {
             return Err(value);
         }
 
-        todo!(
-            "留白 P0（对照问答录 Q3a，就两步，顺序是全部内容）：
-             ① 把货写进槽：unsafe {{ self.buffer.write(b, value) }}（plain 写——为什么可以？Q4c）
-             ② 发布：bottom.store(b + 1, ??)。
-                问自己：这一步是在向 thief 发布「slot 里有货了」吗（publication）？
-                该用什么序？（你修正过我的那个点，就在这里落地）
-             然后 return Ok(())"
-        )
+        // ① 真正的数据放到独立堆对象中，
+        //    slot 只保存这个对象的地址。
+        self.buffer.write(b, value);
+
+        // ② 发布：
+        //    thief Acquire 看到新的 bottom 后，
+        //    就能看到前面的 slot.store(ptr)。
+        self.bottom
+            .store(b.wrapping_add(1), Ordering::Release);
+
+        Ok(())
     }
 
     /// owner 出队（LIFO 端，拿最新的）。
     pub(crate) fn pop(&self) -> Option<T> {
-        // ---- 私账阶段：动 bottom 不需要和任何人商量（Q3b）----
+        // ---- 私账阶段 ----
         let b = self.bottom.load(Ordering::Relaxed);
         let t = self.top.load(Ordering::Acquire);
+
         if b.wrapping_sub(t) <= 0 {
-            return None; // 空。此刻还没有任何「可能撞车」的动作，不需要 fence（Q4a 想清楚这点）
+            return None;
         }
 
-        // 乐观预约：先把最后一个位置划到自己名下（Q3b「先斩后奏」）
+        // 先斩后奏：预约 bottom - 1
         let new_b = b - 1;
-        self.bottom.store(new_b, Ordering::Release); // 收缩也在发布状态：thief 的「还有没有货」判断读的是它
 
-        // ---- 公账阶段：从这行起，可能和 thief 撞车（Q4a 的战场）----
-        fence(Ordering::SeqCst); // 至少一方必须看到足够新的对方，打破「双赢」（Q4a）
+        self.bottom.store(new_b, Ordering::Release);
+
+        // ---- 可能和 thief 撞车 ----
+        fence(Ordering::SeqCst);
+
         let t = self.top.load(Ordering::Acquire);
 
-        todo!(
-            "留白 P1（三个分支，对照问答录 Q3c / Q3d / Q3e）：
-             分支一 new_b > t：两端不撞车，这件货的独占权来自我的预约（thief 够不到 new_b）
-               → unsafe {{ let job = self.buffer.read(new_b); Some(job) }}
-             分支二 new_b == t：只剩这一件，公账仲裁
-               → CAS(top, t → t+1)：赢了读走；输了不读槽，但私账 new_b 已经划出去了，
-                 必须修回一个值让「空队列」重新自洽（修回几？想一想 thief 赢后 top 变成了几）
-             分支三 new_b < t：thief 已经偷穿了，我扑空 → 私账同样要修回去，return None"
-        )
+        // ① 还有不止一件，owner 稳赢
+        if new_b > t {
+            let ptr = self.buffer.load_ptr(new_b);
+
+            debug_assert!(!ptr.is_null());
+
+            return Some(unsafe {
+                *Box::from_raw(ptr)
+            });
+        }
+
+        // ② 最后一件，和 thief 通过 top 仲裁
+        if new_b == t {
+            let won = self
+                .top
+                .compare_exchange(
+                    t,
+                    t.wrapping_add(1),
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                )
+                .is_ok();
+
+            // 无论谁赢，最后状态都应该恢复为空：
+            //
+            // top    = t + 1
+            // bottom = t + 1
+            self.bottom
+                .store(new_b.wrapping_add(1), Ordering::Relaxed);
+
+            if won {
+                let ptr = self.buffer.load_ptr(new_b);
+
+                debug_assert!(!ptr.is_null());
+
+                return Some(unsafe {
+                    *Box::from_raw(ptr)
+                });
+            }
+
+            return None;
+        }
+
+        // ③ new_b < t
+        //
+        // thief 已经推进了 top，
+        // owner 刚才的 bottom-- 预约失败。
+        self.bottom
+            .store(new_b.wrapping_add(1), Ordering::Relaxed);
+
+        None
     }
 
     /// thief 偷（FIFO 端，拿最老的）。谁都可以调，包括 owner 自己（测试里就这么用）。
     pub(crate) fn steal(&self) -> Option<T> {
-        // thief 的一切从公账开始（Q3d：先取号，再确认有货）
-        let t = self.top.load(Ordering::Acquire);
-        fence(Ordering::SeqCst); // Q4a：不许双方各自基于旧世界同时宣布胜利
-        let b = self.bottom.load(Ordering::Acquire); // Acquire = publication 的接收端：
-                                                     // 接住 owner push 对 bottom 的 Release 发布，
-                                                     // slot 里的货才能 happens-before 到我手里
-                                                     //（Q4b：修正后落地的位置）
-        if t >= b {
-            return None; // 空。读到旧值没关系（允许 stale），后面的 CAS 兜底
-        }
+        loop {
+            let t = self.top.load(Ordering::Acquire);
 
-        todo!(
-            "留白 P2（对照问答录 Q3d / Q3e）：
-             ① CAS(top, t → t+1)：先竞争，赢了才记账。
-                成功用 AcqRel——想想这个 CAS 同时是一次 acquire（接住 top 上的发布链）
-                和一次 release（把「我赢了」发布给别人）；失败 Relaxed。
-             ② 赢了：这才第一次碰 payload——unsafe {{ let job = self.buffer.read(t); Some(job) }}
-             ③ 输了：直接 return None。
-                想清楚 Q3e：为什么 thief 输了什么都不用回滚？（你答过：先竞争，赢了再记账）"
-        )
+            fence(Ordering::SeqCst);
+
+            let b = self.bottom.load(Ordering::Acquire);
+
+            if t >= b {
+                return None;
+            }
+
+            if self
+                .top
+                .compare_exchange(
+                    t,
+                    t.wrapping_add(1),
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                // 赢了 CAS 才去取地址：「先竞争，赢了再记账」。
+                // 好处是没赢过就不存在「抄了地址、要不要释放」的问题。
+                //
+                // 第一层保证地址值是对的，读到的是ptr_t
+                // 第二层保证货本身写得完 BOX 里的 T 字段全部可见
+                let ptr = self.buffer.load_ptr(t);
+
+                debug_assert!(!ptr.is_null());
+
+                let value = unsafe {
+                    *Box::from_raw(ptr)
+                };
+
+                return Some(value);
+            }
+
+            // CAS 输：这一件被别人先领走了。
+            // top 是别人推的，我没改过账、也没取过地址，
+            // 所以什么都不用回滚 —— 回到循环顶部重新读 top 再来。
+        }
     }
 
     /// 粗略判空（读旧值最多误报空，不会误报非空……吗？——留给你在阶段 4 想清楚这个 bug 面）。
@@ -167,5 +237,98 @@ impl<T> Deque<T> {
         let t = self.top.load(Ordering::Acquire);
         let b = self.bottom.load(Ordering::Relaxed);
         b.wrapping_sub(t) <= 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Arc;
+
+    /// owner 视角是栈：后进先出。
+    #[test]
+    fn owner_pop_is_lifo() {
+        let q = Deque::new();
+        for i in 0..8 {
+            assert!(q.push(i).is_ok());
+        }
+        for expected in (0..8).rev() {
+            assert_eq!(q.pop(), Some(expected));
+        }
+        assert_eq!(q.pop(), None);
+    }
+
+    /// thief 视角是队列：先进先出（偷最老的）。
+    #[test]
+    fn steal_is_fifo() {
+        let q = Deque::new();
+        for i in 0..8 {
+            assert!(q.push(i).is_ok());
+        }
+        for expected in 0..8 {
+            assert_eq!(q.steal(), Some(expected));
+        }
+        assert_eq!(q.steal(), None);
+    }
+
+    /// 固定容量：满了原样退回，不丢数据。
+    #[test]
+    fn push_full_returns_value_back() {
+        let q = Deque::with_capacity(4);
+        for i in 0..4 {
+            assert!(q.push(i).is_ok());
+        }
+        assert_eq!(q.push(99), Err(99));
+        // 消费一个后又腾出位置
+        assert_eq!(q.pop(), Some(3));
+        assert!(q.push(100).is_ok());
+    }
+
+    /// 锤子测试：owner 一头 pop，3 个 thief 同时偷。
+    /// 验的正是协议的安全声明：每件任务恰好被消费一次（不重复、不丢失）。
+    /// 这里如果 P1/P2 写错（比如最后一件双双得手），这个测试就是第一批目击者。
+    #[test]
+    fn concurrent_drain_each_task_consumed_once() {
+        const N: usize = 1024;
+        let q = Arc::new(Deque::<usize>::new());
+        for i in 0..N {
+            q.push(i).expect("容量刚好装下 N 件");
+        }
+
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let double = Arc::new(AtomicUsize::new(0));
+        let seen: Arc<Vec<AtomicBool>> =
+            Arc::new((0..N).map(|_| AtomicBool::new(false)).collect());
+
+        std::thread::scope(|s| {
+            for _ in 0..3 {
+                let q = Arc::clone(&q);
+                let consumed = Arc::clone(&consumed);
+                let double = Arc::clone(&double);
+                let seen = Arc::clone(&seen);
+                s.spawn(move || loop {
+                    match q.steal() {
+                        Some(i) => {
+                            consumed.fetch_add(1, Ordering::Relaxed);
+                            if seen[i].swap(true, Ordering::Relaxed) {
+                                double.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        None => break,
+                    }
+                });
+            }
+            // owner 同时从另一头拿
+            while let Some(i) = q.pop() {
+                consumed.fetch_add(1, Ordering::Relaxed);
+                if seen[i].swap(true, Ordering::Relaxed) {
+                    double.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+
+        assert_eq!(double.load(Ordering::Relaxed), 0, "同一件任务被消费了两次");
+        assert_eq!(consumed.load(Ordering::Relaxed), N, "有任务丢了");
     }
 }
